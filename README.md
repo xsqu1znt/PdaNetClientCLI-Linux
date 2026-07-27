@@ -2,6 +2,7 @@
 
 A standalone Linux client for PdaNet+ Wi-Fi proxy and USB tethering modes.
 It does not use Android's built-in tethering APIs.
+**NOTE:** Currently only tested on my own machine (Fedora Linux 43)
 
 ## Install
 
