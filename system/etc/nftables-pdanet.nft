@@ -1,0 +1,25 @@
+table inet pdanet {
+  chain output_nat {
+    type nat hook output priority dstnat; policy accept;
+
+    ip daddr 127.0.0.0/8 return
+    ip6 daddr ::1 return
+
+    udp dport 53 redirect to :5300
+    tcp dport 53 redirect to :5300
+
+    meta nfproto ipv6 return
+    ip daddr 192.168.49.1 return
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+
+    meta l4proto tcp redirect to :12345
+  }
+
+  chain output_filter {
+    type filter hook output priority filter; policy accept;
+
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
+    meta nfproto ipv6 return
+    udp dport 443 reject with icmpx type port-unreachable
+  }
+}

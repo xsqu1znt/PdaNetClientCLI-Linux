@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Bridge a Linux TUN interface to PdaNet's Android packet tunnel."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import os
+import platform
+import random
+import selectors
+import signal
+import socket
+import struct
+import sys
+import time
+from dataclasses import dataclass
+
+
+HEADER_SIZE = 32
+MAX_PAYLOAD = 65535
+CMD_HELLO = 15
+CMD_IP_PACKET = 64
+CMD_DEVICE_MODEL = 302
+CLIENT_FLAG_RAW_IP = 64
+
+IFF_TUN = 0x0001
+IFF_NO_PI = 0x1000
+TUNSETIFF = 0x400454CA
+
+
+class ProtocolError(RuntimeError):
+    pass
+
+
+def log(message: str) -> None:
+    print(f"pdanet-usb-helper: {message}", file=sys.stderr, flush=True)
+
+
+def encode_client_frame(command: int, payload: bytes = b"", flags: int = 0) -> bytes:
+    """Encode the phone-bound eight-word header used by PdaNet clients."""
+    if len(payload) > MAX_PAYLOAD:
+        raise ProtocolError(f"payload is too large: {len(payload)}")
+    return struct.pack(
+        ">8I",
+        command & 0xFFFFFFFF,
+        0,
+        0,
+        len(payload),
+        0,
+        0,
+        0,
+        flags & 0xFFFFFFFF,
+    ) + payload
+
+
+@dataclass(frozen=True)
+class ServerFrame:
+    command: int
+    sequence: int
+    payload: bytes
+    status: int
+
+
+class ServerFrameDecoder:
+    """Decode the little-endian, phone-to-client PdaNet frame format."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[ServerFrame]:
+        self.buffer.extend(data)
+        frames: list[ServerFrame] = []
+        while len(self.buffer) >= HEADER_SIZE:
+            words = struct.unpack_from("<8I", self.buffer)
+            command, status, _, sequence, payload_length, flags, _, _ = words
+            if payload_length > MAX_PAYLOAD:
+                raise ProtocolError(
+                    f"invalid server payload length {payload_length} "
+                    f"for command {command}"
+                )
+            frame_length = HEADER_SIZE + payload_length
+            if len(self.buffer) < frame_length:
+                break
+            payload = bytes(self.buffer[HEADER_SIZE:frame_length])
+            del self.buffer[:frame_length]
+            frames.append(ServerFrame(command, sequence, payload, status | flags))
+        return frames
+
+
+def parse_endpoint(value: str) -> tuple[str, int]:
+    host, separator, port_text = value.rpartition(":")
+    if not separator or not host:
+        raise argparse.ArgumentTypeError("endpoint must be HOST:PORT")
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("endpoint port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("endpoint port must be between 1 and 65535")
+    return host, port
+
+
+def connect_phone(endpoint: tuple[str, int], timeout: float) -> socket.socket:
+    connection = socket.create_connection(endpoint, timeout=timeout)
+    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    connection.sendall(
+        encode_client_frame(CMD_HELLO, flags=CLIENT_FLAG_RAW_IP)
+    )
+    model = f"Linux {platform.node() or 'PdaNet'}".encode("utf-16le")
+    connection.sendall(encode_client_frame(CMD_DEVICE_MODEL, model))
+    return connection
+
+
+def open_tun(name: str) -> tuple[int, str]:
+    descriptor = os.open("/dev/net/tun", os.O_RDWR | os.O_NONBLOCK)
+    request = struct.pack("16sH", name.encode("ascii"), IFF_TUN | IFF_NO_PI)
+    response = fcntl.ioctl(descriptor, TUNSETIFF, request)
+    actual_name = response[:16].split(b"\0", 1)[0].decode("ascii")
+    return descriptor, actual_name
+
+
+def checksum(data: bytes) -> int:
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def build_dns_probe(
+    transaction_id: int,
+    source_port: int,
+    destination: str = "8.8.8.8",
+) -> bytes:
+    labels = b"".join(bytes((len(part),)) + part for part in b"example.com".split(b"."))
+    dns = (
+        struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0)
+        + labels
+        + b"\0"
+        + struct.pack("!HH", 1, 1)
+    )
+    source_address = socket.inet_aton("10.1.19.2")
+    destination_address = socket.inet_aton(destination)
+    udp_length = 8 + len(dns)
+    pseudo_header = (
+        source_address
+        + destination_address
+        + struct.pack("!BBH", 0, socket.IPPROTO_UDP, udp_length)
+    )
+    udp_header = struct.pack("!HHHH", source_port, 53, udp_length, 0)
+    udp_checksum = checksum(pseudo_header + udp_header + dns)
+    if udp_checksum == 0:
+        udp_checksum = 0xFFFF
+    udp_header = struct.pack("!HHHH", source_port, 53, udp_length, udp_checksum)
+
+    total_length = 20 + udp_length
+    identification = random.randrange(0, 65536)
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        total_length,
+        identification,
+        0,
+        64,
+        socket.IPPROTO_UDP,
+        0,
+        source_address,
+        destination_address,
+    )
+    ip_checksum = checksum(ip_header)
+    ip_header = struct.pack(
+        "!BBHHHBBH4s4s",
+        0x45,
+        0,
+        total_length,
+        identification,
+        0,
+        64,
+        socket.IPPROTO_UDP,
+        ip_checksum,
+        source_address,
+        destination_address,
+    )
+    return ip_header + udp_header + dns
+
+
+def is_dns_probe_response(
+    packet: bytes,
+    transaction_id: int,
+    source_port: int,
+) -> bool:
+    if len(packet) < 28 or packet[0] >> 4 != 4:
+        return False
+    header_length = (packet[0] & 0x0F) * 4
+    if header_length < 20 or len(packet) < header_length + 8:
+        return False
+    if packet[9] != socket.IPPROTO_UDP:
+        return False
+    udp = packet[header_length:]
+    remote_port, local_port, udp_length, _ = struct.unpack_from("!HHHH", udp)
+    if remote_port != 53 or local_port != source_port:
+        return False
+    if udp_length < 20 or len(udp) < udp_length:
+        return False
+    response_id, flags = struct.unpack_from("!HH", udp, 8)
+    return response_id == transaction_id and bool(flags & 0x8000)
+
+
+def run_probe(endpoint: tuple[str, int], timeout: float) -> int:
+    transaction_id = random.randrange(0, 65536)
+    source_port = random.randrange(32768, 60999)
+    packet = build_dns_probe(transaction_id, source_port)
+    decoder = ServerFrameDecoder()
+
+    with connect_phone(endpoint, timeout) as connection:
+        connection.settimeout(min(timeout, 1.0))
+        connection.sendall(encode_client_frame(CMD_IP_PACKET, packet))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data = connection.recv(65536)
+            except socket.timeout:
+                continue
+            if not data:
+                raise ProtocolError("phone closed the PdaNet tunnel during the probe")
+            for frame in decoder.feed(data):
+                if (
+                    frame.command == CMD_IP_PACKET
+                    and is_dns_probe_response(
+                        frame.payload, transaction_id, source_port
+                    )
+                ):
+                    print("PdaNet USB protocol and DNS forwarding are working.")
+                    return 0
+                if frame.command in (29, 31) and frame.payload:
+                    message = frame.payload.decode("utf-8", errors="replace")
+                    log(f"phone status: {message}")
+    raise ProtocolError("timed out waiting for the tunneled DNS response")
+
+
+def run_bridge(endpoint: tuple[str, int], tun_name: str, timeout: float) -> int:
+    stopped = False
+
+    def stop(_signum: int, _frame: object) -> None:
+        nonlocal stopped
+        stopped = True
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    tun_descriptor, actual_name = open_tun(tun_name)
+    decoder = ServerFrameDecoder()
+    try:
+        with connect_phone(endpoint, timeout) as connection:
+            selector = selectors.DefaultSelector()
+            selector.register(tun_descriptor, selectors.EVENT_READ, "tun")
+            selector.register(connection, selectors.EVENT_READ, "phone")
+            log(f"connected; forwarding IPv4 packets on {actual_name}")
+            while not stopped:
+                for key, _ in selector.select(timeout=1.0):
+                    if key.data == "tun":
+                        try:
+                            packet = os.read(tun_descriptor, MAX_PAYLOAD)
+                        except BlockingIOError:
+                            continue
+                        if packet and packet[0] >> 4 == 4:
+                            connection.sendall(
+                                encode_client_frame(CMD_IP_PACKET, packet)
+                            )
+                    else:
+                        try:
+                            data = connection.recv(65536)
+                        except BlockingIOError:
+                            continue
+                        if not data:
+                            raise ProtocolError("phone closed the PdaNet tunnel")
+                        for frame in decoder.feed(data):
+                            if frame.command == CMD_IP_PACKET and frame.payload:
+                                os.write(tun_descriptor, frame.payload)
+                            elif frame.command in (29, 31) and frame.payload:
+                                message = frame.payload.decode(
+                                    "utf-8", errors="replace"
+                                )
+                                log(f"phone status: {message}")
+            selector.close()
+    finally:
+        os.close(tun_descriptor)
+    return 0
+
+
+def run_self_test() -> int:
+    payload = b"\x45" + bytes(range(1, 64))
+    encoded = encode_client_frame(CMD_IP_PACKET, payload)
+    assert len(encoded) == HEADER_SIZE + len(payload)
+    assert struct.unpack(">8I", encoded[:HEADER_SIZE]) == (
+        CMD_IP_PACKET,
+        0,
+        0,
+        len(payload),
+        0,
+        0,
+        0,
+        0,
+    )
+
+    server_header = struct.pack("<8I", CMD_IP_PACKET, 0, 0, 7, len(payload), 0, 0, 0)
+    decoder = ServerFrameDecoder()
+    assert decoder.feed(server_header[:11]) == []
+    frames = decoder.feed(server_header[11:] + payload)
+    assert frames == [ServerFrame(CMD_IP_PACKET, 7, payload, 0)]
+
+    transaction_id = 0x1234
+    source_port = 40000
+    packet = build_dns_probe(transaction_id, source_port)
+    assert packet[0] == 0x45
+    assert struct.unpack_from("!H", packet, 2)[0] == len(packet)
+    assert checksum(packet[:20]) == 0
+    assert socket.inet_ntoa(packet[12:16]) == "10.1.19.2"
+    assert socket.inet_ntoa(packet[16:20]) == "8.8.8.8"
+    print("pdanet-usb-helper self-test passed.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--connect", type=parse_endpoint)
+    parser.add_argument("--tun", default="pdanet0")
+    parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--timeout", type=float, default=12.0)
+    arguments = parser.parse_args()
+
+    if arguments.self_test:
+        return run_self_test()
+    if arguments.connect is None:
+        parser.error("--connect is required unless --self-test is used")
+    if arguments.probe:
+        return run_probe(arguments.connect, arguments.timeout)
+    return run_bridge(arguments.connect, arguments.tun, arguments.timeout)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ProtocolError) as error:
+        if isinstance(error, OSError) and error.errno == errno.EPERM:
+            log(f"{error}; TUN mode must run as root")
+        else:
+            log(str(error))
+        raise SystemExit(1)

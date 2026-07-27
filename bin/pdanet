@@ -1,0 +1,782 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+readonly PDANET_PROXY_HOST="${PDANET_PROXY_HOST:-192.168.49.1}"
+readonly PDANET_PROXY_PORT="${PDANET_PROXY_PORT:-8000}"
+readonly PDANET_REDSOCKS_PORT="${PDANET_REDSOCKS_PORT:-12345}"
+readonly PDANET_DNS_PORT="${PDANET_DNS_PORT:-5300}"
+readonly PDANET_NFT_FILE="/etc/nftables-pdanet.nft"
+readonly PDANET_STATE_DIR="/run/pdanet-tproxy"
+readonly PDANET_IFACE_FILE="$PDANET_STATE_DIR/interface"
+readonly REDSOCKS_SERVICE="pdanet-redsocks.service"
+readonly DNS_SERVICE="pdanet-dnscrypt.service"
+readonly PDANET_USB_HELPER="${PDANET_USB_HELPER:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../libexec/pdanet-usb-helper}"
+readonly PDANET_USB_STATE_DIR="/run/pdanet-usb"
+readonly PDANET_USB_IFACE="${PDANET_USB_IFACE:-pdanet0}"
+readonly PDANET_USB_ADDRESS="10.1.19.2/24"
+readonly PDANET_USB_DNS="8.8.8.8"
+readonly PDANET_USB_SERIAL_FILE="$PDANET_USB_STATE_DIR/serial"
+readonly PDANET_USB_PORT_FILE="$PDANET_USB_STATE_DIR/local-port"
+readonly PDANET_USB_TARGET_FILE="$PDANET_USB_STATE_DIR/remote-target"
+readonly PDANET_USB_PID_FILE="$PDANET_USB_STATE_DIR/helper-pid"
+readonly PDANET_USB_LOG_FILE="$PDANET_USB_STATE_DIR/helper.log"
+readonly -a PDANET_USB_ROUTES=(
+  "0.0.0.0/1"
+  "128.0.0.0/2"
+  "192.0.0.0/9"
+  "192.128.0.0/11"
+  "192.160.0.0/13"
+  "192.169.0.0/16"
+  "192.170.0.0/15"
+  "192.172.0.0/14"
+  "192.176.0.0/12"
+  "192.192.0.0/10"
+  "193.0.0.0/8"
+  "194.0.0.0/7"
+  "196.0.0.0/6"
+  "200.0.0.0/5"
+  "208.0.0.0/4"
+  "240.0.0.0/4"
+)
+readonly -a PDANET_USB_IPV6_BLOCK_ROUTES=("::/1" "8000::/1")
+
+step() {
+  printf '  [%s/%s] %s\n' "$1" "$2" "$3"
+}
+
+ok() {
+  printf '  OK  %s\n' "$*"
+}
+
+warn() {
+  printf '  !!  %s\n' "$*" >&2
+}
+
+die() {
+  printf '  ERROR  %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: pdanet COMMAND
+
+Commands:
+  on              Enable transparent TCP and DNS proxying
+  off             Disable proxying and restore normal DNS
+  restart         Disable and re-enable proxying
+  status          Show the current proxy state
+  test            Test DNS and HTTPS through the transparent proxy
+  speedtest       Measure download and upload speed through PdaNet
+  logs [LINES]    Show recent service logs (default: 50 lines)
+  usb [on]        Enable PdaNet USB through an ADB-backed TUN interface
+  usb off         Disable USB mode and remove only its routes/ADB forward
+  usb status      Show USB helper, interface, route, and ADB state
+  usb test        Safely test the USB protocol without changing routes
+  usb logs        Show the USB helper log
+  help            Show this help
+
+The upstream PdaNet proxy carries TCP, not ICMP or general UDP. Therefore
+"ping" is not a valid connection test; use "pdanet test" instead.
+
+"pdanet usb test" does not change the default route or DNS. "pdanet usb"
+does, and may interrupt existing network sessions.
+EOF
+}
+
+require_root() {
+  if (( EUID != 0 )); then
+    exec sudo -- "$0" "$@"
+  fi
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+default_iface() {
+  ip -4 route show default | awk 'NR == 1 { print $5 }'
+}
+
+saved_iface() {
+  if [[ -r "$PDANET_IFACE_FILE" ]]; then
+    head -n 1 "$PDANET_IFACE_FILE"
+  fi
+}
+
+selected_iface() {
+  local iface="${PDANET_IFACE:-}"
+  if [[ -z "$iface" ]]; then
+    iface="$(default_iface)"
+  fi
+  [[ -n "$iface" ]] || die "Could not determine the default IPv4 interface."
+  ip link show dev "$iface" >/dev/null 2>&1 || die "Interface does not exist: $iface"
+  printf '%s\n' "$iface"
+}
+
+services_active() {
+  systemctl is-active --quiet "$REDSOCKS_SERVICE" \
+    && systemctl is-active --quiet "$DNS_SERVICE"
+}
+
+proxy_reachable() {
+  timeout 5 bash -c "exec 3<>/dev/tcp/${PDANET_PROXY_HOST}/${PDANET_PROXY_PORT}"
+}
+
+wait_for_listener() {
+  local port="$1"
+  local attempt
+  for attempt in {1..30}; do
+    if ss -H -lnt | awk '{ print $4 }' | grep -qE ":${port}$"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+remove_nft() {
+  nft delete table inet pdanet 2>/dev/null || true
+}
+
+stop_services() {
+  systemctl stop "$DNS_SERVICE" "$REDSOCKS_SERVICE" 2>/dev/null || true
+}
+
+clear_state() {
+  rm -f -- "$PDANET_IFACE_FILE"
+  rmdir -- "$PDANET_STATE_DIR" 2>/dev/null || true
+}
+
+rollback_on_failure() {
+  local iface="$1"
+  warn "Activation failed; restoring the previous network state."
+  resolvectl revert "$iface" 2>/dev/null || true
+  resolvectl flush-caches 2>/dev/null || true
+  remove_nft
+  stop_services
+  clear_state
+  logger -t pdanet-cli "activation failed on ${iface}; rolled back" || true
+}
+
+run_test() {
+  local failed=0
+
+  printf 'PdaNet connection test\n'
+  step 1 2 "Resolving example.com through system DNS..."
+  if timeout 15 getent ahostsv4 example.com >/dev/null; then
+    ok "DNS resolution works."
+  else
+    warn "DNS resolution failed."
+    failed=1
+  fi
+
+  step 2 2 "Opening HTTPS without proxy environment variables..."
+  if env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+      -u http_proxy -u https_proxy -u all_proxy \
+      curl --noproxy '*' --fail --silent --show-error \
+      --max-time 15 --output /dev/null https://example.com; then
+    ok "Transparent HTTPS works."
+  else
+    warn "Transparent HTTPS failed."
+    failed=1
+  fi
+
+  if (( failed == 0 )); then
+    ok "Connection is healthy."
+  else
+    return 1
+  fi
+}
+
+format_mbps() {
+  awk -v bytes_per_second="$1" 'BEGIN {
+    printf "%.2f", (bytes_per_second * 8) / 1000000
+  }'
+}
+
+run_speedtest() {
+  local bytes="${PDANET_SPEEDTEST_BYTES:-10000000}"
+  local download_speed upload_speed upload_file latency latency_ms sample
+  local -a latency_samples=()
+
+  need_cmd awk
+  need_cmd curl
+  need_cmd mktemp
+  need_cmd truncate
+  [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes >= 100000 )) \
+    || die "PDANET_SPEEDTEST_BYTES must be an integer of at least 100000."
+
+  printf 'PdaNet speed test (Cloudflare edge)\n'
+  printf '  Data size: %.1f MB in each direction\n' "$(awk -v bytes="$bytes" 'BEGIN { print bytes / 1000000 }')"
+
+  step 1 4 "Warming up the connection..."
+  if ! env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+      -u http_proxy -u https_proxy -u all_proxy \
+      curl --noproxy '*' --fail --silent --show-error \
+      --max-time 20 --output /dev/null \
+      'https://speed.cloudflare.com/__down?bytes=100000'; then
+    die "Could not reach the Cloudflare speed-test endpoint."
+  fi
+  ok "Connection ready."
+
+  step 2 4 "Measuring application latency..."
+  for sample in {1..5}; do
+    if ! latency="$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+        -u http_proxy -u https_proxy -u all_proxy \
+        curl --noproxy '*' --fail --silent --show-error \
+        --max-time 15 --output /dev/null --write-out '%{time_starttransfer}' \
+        'https://speed.cloudflare.com/__down?bytes=0')"; then
+      die "Latency measurement failed."
+    fi
+    latency_samples+=("$latency")
+  done
+  latency_ms="$(printf '%s\n' "${latency_samples[@]}" | awk '
+    { total += $1 }
+    END { printf "%.1f", (total / NR) * 1000 }
+  ')"
+  ok "Latency:  ${latency_ms} ms"
+
+  step 3 4 "Measuring download speed..."
+  if ! download_speed="$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+      -u http_proxy -u https_proxy -u all_proxy \
+      curl --noproxy '*' --fail --silent --show-error \
+      --max-time 120 --output /dev/null --write-out '%{speed_download}' \
+      "https://speed.cloudflare.com/__down?bytes=${bytes}")"; then
+    die "Download measurement failed."
+  fi
+  ok "Download: $(format_mbps "$download_speed") Mbps"
+
+  step 4 4 "Measuring upload speed..."
+  upload_file="$(mktemp /tmp/pdanet-speedtest.XXXXXX)"
+  trap 'rm -f -- "${upload_file:-}"' EXIT RETURN
+  truncate -s "$bytes" "$upload_file"
+  if ! upload_speed="$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+      -u http_proxy -u https_proxy -u all_proxy \
+      curl --noproxy '*' --fail --silent --show-error \
+      --max-time 120 --output /dev/null --write-out '%{speed_upload}' \
+      --header 'Content-Type: application/octet-stream' \
+      --data-binary "@${upload_file}" \
+      'https://speed.cloudflare.com/__up')"; then
+    die "Upload measurement failed."
+  fi
+  rm -f -- "$upload_file"
+  upload_file=""
+  trap - EXIT RETURN
+  ok "Upload:   $(format_mbps "$upload_speed") Mbps"
+
+  printf '\nSpeed through PdaNet\n'
+  printf '  Latency:  %s ms\n' "$latency_ms"
+  printf '  Download: %s Mbps\n' "$(format_mbps "$download_speed")"
+  printf '  Upload:   %s Mbps\n' "$(format_mbps "$upload_speed")"
+}
+
+turn_on() {
+  local iface
+
+  require_root on
+
+  if [[ -n "$(saved_iface)" ]] && services_active; then
+    iface="$(saved_iface)"
+    printf 'PdaNet proxy\n'
+    ok "Already enabled on $iface; no network changes made."
+    run_test
+    return
+  fi
+
+  iface="$(selected_iface)"
+  printf 'Enabling PdaNet proxy on %s\n' "$iface"
+
+  step 1 5 "Checking required tools and PdaNet proxy..."
+  need_cmd curl
+  need_cmd dnscrypt-proxy
+  need_cmd getent
+  need_cmd ip
+  need_cmd nft
+  need_cmd redsocks
+  need_cmd resolvectl
+  need_cmd ss
+  need_cmd systemctl
+  need_cmd timeout
+  [[ -r "$PDANET_NFT_FILE" ]] || die "Missing nftables rules: $PDANET_NFT_FILE"
+  proxy_reachable || die "Proxy is unreachable at ${PDANET_PROXY_HOST}:${PDANET_PROXY_PORT}."
+  ok "PdaNet proxy is reachable."
+
+  mkdir -p -- "$PDANET_STATE_DIR"
+  printf '%s\n' "$iface" > "$PDANET_IFACE_FILE"
+
+  step 2 5 "Starting transparent TCP and encrypted DNS services..."
+  if ! systemctl start "$REDSOCKS_SERVICE" "$DNS_SERVICE"; then
+    rollback_on_failure "$iface"
+    die "Could not start the proxy services."
+  fi
+  if ! wait_for_listener "$PDANET_REDSOCKS_PORT" || ! wait_for_listener "$PDANET_DNS_PORT"; then
+    rollback_on_failure "$iface"
+    die "Proxy services did not open their local ports."
+  fi
+  ok "Proxy services are listening."
+
+  step 3 5 "Routing system TCP and DNS through PdaNet..."
+  remove_nft
+  if ! nft -f "$PDANET_NFT_FILE"; then
+    rollback_on_failure "$iface"
+    die "Could not load the PdaNet nftables rules."
+  fi
+  ok "Transparent routing rules are active."
+
+  step 4 5 "Pointing system DNS at the local encrypted resolver..."
+  if ! resolvectl dns "$iface" "127.0.0.1:${PDANET_DNS_PORT}" \
+    || ! resolvectl domain "$iface" '~.' \
+    || ! resolvectl default-route "$iface" yes; then
+    rollback_on_failure "$iface"
+    die "Could not route system DNS through the local resolver."
+  fi
+  resolvectl flush-caches || true
+  ok "System DNS is routed through PdaNet."
+
+  step 5 5 "Verifying DNS..."
+  if ! timeout 15 resolvectl query example.com >/dev/null; then
+    rollback_on_failure "$iface"
+    die "Transparent DNS verification failed."
+  fi
+
+  logger -t pdanet-cli "enabled on ${iface} via ${PDANET_PROXY_HOST}:${PDANET_PROXY_PORT}" || true
+  ok "PdaNet proxy enabled. TCP and DNS are transparent; external QUIC is disabled."
+}
+
+turn_off() {
+  local iface
+
+  require_root off
+  if [[ -d "$PDANET_USB_STATE_DIR" ]]; then
+    usb_turn_off
+  fi
+  iface="$(saved_iface)"
+  if [[ -z "$iface" ]]; then
+    iface="${PDANET_IFACE:-$(default_iface)}"
+  fi
+
+  printf 'Disabling PdaNet proxy\n'
+  step 1 3 "Restoring normal system DNS..."
+  if [[ -n "$iface" ]]; then
+    resolvectl revert "$iface" 2>/dev/null || true
+  fi
+  resolvectl flush-caches 2>/dev/null || true
+  ok "DNS settings restored."
+
+  step 2 3 "Removing transparent routing rules..."
+  remove_nft
+  ok "Routing rules removed."
+
+  step 3 3 "Stopping proxy services..."
+  stop_services
+  clear_state
+  logger -t pdanet-cli "disabled${iface:+ on ${iface}}" || true
+  ok "PdaNet proxy disabled."
+}
+
+show_status() {
+  local iface redsocks_state dns_state overall
+  iface="$(saved_iface)"
+  redsocks_state="$(systemctl is-active "$REDSOCKS_SERVICE" 2>/dev/null || true)"
+  dns_state="$(systemctl is-active "$DNS_SERVICE" 2>/dev/null || true)"
+
+  if [[ -n "$iface" && "$redsocks_state" == active && "$dns_state" == active ]]; then
+    overall="enabled"
+  else
+    overall="disabled"
+  fi
+
+  printf 'PdaNet proxy: %s\n' "$overall"
+  printf '  Interface:    %s\n' "${iface:-none}"
+  printf '  TCP service:  %s\n' "${redsocks_state:-unknown}"
+  printf '  DNS service:  %s\n' "${dns_state:-unknown}"
+  printf '  Upstream:     http://%s:%s\n' "$PDANET_PROXY_HOST" "$PDANET_PROXY_PORT"
+  printf '  Note:         ICMP ping and general UDP are not supported by the upstream proxy.\n'
+  printf '\n'
+  usb_show_status
+}
+
+show_logs() {
+  local lines="${1:-50}"
+  [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > 0 )) \
+    || die "Log line count must be a positive number."
+  printf '%s\n' 'PdaNet lifecycle'
+  journalctl -t pdanet-cli -n "$lines" --no-pager
+  printf '\n%s\n' 'Proxy services'
+  journalctl -u "$REDSOCKS_SERVICE" -u "$DNS_SERVICE" \
+    -n "$lines" --no-pager
+}
+
+usb_saved_value() {
+  local file="$1"
+  if [[ -r "$file" ]]; then
+    head -n 1 "$file"
+  fi
+}
+
+usb_helper_pid() {
+  usb_saved_value "$PDANET_USB_PID_FILE"
+}
+
+usb_helper_running() {
+  local pid command_line
+  pid="$(usb_helper_pid)"
+  [[ "$pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$pid/cmdline" ]] || return 1
+  command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+  [[ "$command_line" == *"$PDANET_USB_HELPER"* ]]
+}
+
+usb_select_serial() {
+  local requested="${PDANET_ADB_SERIAL:-}"
+  local line
+  local -a devices=()
+
+  need_cmd adb
+  if [[ -n "$requested" ]]; then
+    if adb -s "$requested" get-state 2>/dev/null | grep -qx device; then
+      printf '%s\n' "$requested"
+      return
+    fi
+    die "ADB device is not available or authorized: $requested"
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && devices+=("$line")
+  done < <(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')
+
+  case "${#devices[@]}" in
+    0) die "No authorized ADB device found. Connect the phone and allow USB debugging." ;;
+    1) printf '%s\n' "${devices[0]}" ;;
+    *) die "Multiple ADB devices found. Set PDANET_ADB_SERIAL to select one." ;;
+  esac
+}
+
+usb_remote_target() {
+  local serial="$1"
+
+  if adb -s "$serial" shell ss -H -ltn 2>/dev/null \
+      | awk '{ print $4 }' | grep -qE ':8739$'; then
+    printf '%s\n' 'tcp:8739'
+    return
+  fi
+  if adb -s "$serial" shell cat /proc/net/unix 2>/dev/null \
+      | grep -qE '(^|[@/])pdanet([[:space:]]|$)'; then
+    printf '%s\n' 'localabstract:pdanet'
+    return
+  fi
+  die "PdaNet USB is not listening. Enable USB Tether in the phone app first."
+}
+
+usb_remove_routes() {
+  local route
+
+  for route in "${PDANET_USB_ROUTES[@]}"; do
+    ip -4 route del "$route" dev "$PDANET_USB_IFACE" 2>/dev/null || true
+  done
+  for route in "${PDANET_USB_IPV6_BLOCK_ROUTES[@]}"; do
+    ip -6 route del unreachable "$route" metric 5 2>/dev/null || true
+  done
+}
+
+usb_stop_helper() {
+  local pid command_line attempt
+
+  pid="$(usb_helper_pid)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && [[ -r "/proc/$pid/cmdline" ]]; then
+    command_line="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+    if [[ "$command_line" == *"$PDANET_USB_HELPER"* ]]; then
+      kill "$pid" 2>/dev/null || true
+      for attempt in {1..30}; do
+        [[ ! -d "/proc/$pid" ]] && break
+        sleep 0.1
+      done
+      if [[ -d "/proc/$pid" ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    else
+      warn "Not stopping PID $pid because it is not the PdaNet USB helper."
+    fi
+  fi
+}
+
+usb_remove_forward() {
+  local serial local_port
+
+  serial="$(usb_saved_value "$PDANET_USB_SERIAL_FILE")"
+  local_port="$(usb_saved_value "$PDANET_USB_PORT_FILE")"
+  if [[ -n "$serial" && "$local_port" =~ ^[0-9]+$ ]]; then
+    adb -s "$serial" forward --remove "tcp:$local_port" 2>/dev/null || true
+  fi
+}
+
+usb_clear_state() {
+  rm -f -- \
+    "$PDANET_USB_SERIAL_FILE" \
+    "$PDANET_USB_PORT_FILE" \
+    "$PDANET_USB_TARGET_FILE" \
+    "$PDANET_USB_PID_FILE" \
+    "$PDANET_USB_LOG_FILE"
+  rmdir -- "$PDANET_USB_STATE_DIR" 2>/dev/null || true
+}
+
+usb_cleanup() {
+  [[ -d "$PDANET_USB_STATE_DIR" ]] || return 0
+  resolvectl revert "$PDANET_USB_IFACE" 2>/dev/null || true
+  resolvectl flush-caches 2>/dev/null || true
+  usb_remove_routes
+  usb_stop_helper
+  usb_remove_forward
+  ip link del "$PDANET_USB_IFACE" 2>/dev/null || true
+  usb_clear_state
+}
+
+usb_add_routes() {
+  local route
+
+  for route in "${PDANET_USB_ROUTES[@]}"; do
+    if ip -4 route show exact "$route" | grep -q .; then
+      warn "A route for $route already exists; refusing to replace it."
+      return 1
+    fi
+    ip -4 route add "$route" dev "$PDANET_USB_IFACE" metric 5 || return
+  done
+  for route in "${PDANET_USB_IPV6_BLOCK_ROUTES[@]}"; do
+    if ip -6 route show exact "$route" | grep -q .; then
+      warn "An IPv6 route for $route already exists; refusing to replace it."
+      return 1
+    fi
+    ip -6 route add unreachable "$route" metric 5 || return
+  done
+}
+
+usb_start_impl() {
+  local serial target local_port pid attempt
+
+  serial="$(usb_select_serial)" || return
+  target="$(usb_remote_target "$serial")" || return
+
+  mkdir -p -- "$PDANET_USB_STATE_DIR" || return
+  chmod 0755 "$PDANET_USB_STATE_DIR" || return
+  printf '%s\n' "$serial" > "$PDANET_USB_SERIAL_FILE" || return
+  printf '%s\n' "$target" > "$PDANET_USB_TARGET_FILE" || return
+
+  local_port="$(adb -s "$serial" forward tcp:0 "$target" | tr -d '\r')" || return
+  [[ "$local_port" =~ ^[0-9]+$ ]] || {
+    warn "ADB did not return a valid dynamically allocated port: $local_port"
+    return 1
+  }
+  printf '%s\n' "$local_port" > "$PDANET_USB_PORT_FILE" || return
+
+  : > "$PDANET_USB_LOG_FILE" || return
+  chmod 0644 "$PDANET_USB_LOG_FILE" || return
+  nohup "$PDANET_USB_HELPER" \
+    --connect "127.0.0.1:$local_port" \
+    --tun "$PDANET_USB_IFACE" \
+    >> "$PDANET_USB_LOG_FILE" 2>&1 < /dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "$PDANET_USB_PID_FILE" || return
+
+  for attempt in {1..50}; do
+    if ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1; then
+      break
+    fi
+    [[ -d "/proc/$pid" ]] || return 1
+    sleep 0.1
+  done
+  ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1 || return 1
+  [[ -d "/proc/$pid" ]] || return 1
+
+  ip address replace "$PDANET_USB_ADDRESS" dev "$PDANET_USB_IFACE" || return
+  ip link set dev "$PDANET_USB_IFACE" mtu 1500 up || return
+  usb_add_routes || return
+  resolvectl dns "$PDANET_USB_IFACE" "$PDANET_USB_DNS" || return
+  resolvectl domain "$PDANET_USB_IFACE" '~.' || return
+  resolvectl default-route "$PDANET_USB_IFACE" yes || return
+  resolvectl flush-caches || true
+}
+
+usb_turn_on() {
+  require_root usb on
+
+  [[ -x "$PDANET_USB_HELPER" ]] \
+    || die "Missing executable USB helper: $PDANET_USB_HELPER"
+  need_cmd adb
+  need_cmd ip
+  need_cmd nohup
+  need_cmd resolvectl
+
+  if usb_helper_running \
+      && ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1; then
+    printf 'PdaNet USB\n'
+    ok "Already enabled on $PDANET_USB_IFACE; no network changes made."
+    return
+  fi
+  if [[ -n "$(saved_iface)" ]] || services_active; then
+    die "Wi-Fi proxy mode is active. Run 'pdanet off' before enabling USB mode."
+  fi
+
+  usb_cleanup
+  printf 'Enabling PdaNet USB\n'
+  step 1 4 "Opening an ADB connection to the PdaNet phone service..."
+  if ! usb_start_impl; then
+    if [[ -s "$PDANET_USB_LOG_FILE" ]]; then
+      warn "USB helper output:"
+      tail -n 20 "$PDANET_USB_LOG_FILE" >&2
+    fi
+    usb_cleanup
+    die "USB activation failed. Check the phone and run 'pdanet usb test'."
+  fi
+  ok "PdaNet raw-IP tunnel connected."
+
+  step 2 4 "Configuring $PDANET_USB_IFACE as ${PDANET_USB_ADDRESS}..."
+  ok "TUN interface is up with MTU 1500."
+
+  step 3 4 "Installing scoped IPv4 routes and blocking IPv6 bypass..."
+  ok "Internet routes now prefer the PdaNet tunnel; local 192.168/16 is preserved."
+
+  step 4 4 "Pointing system DNS at $PDANET_USB_DNS through the tunnel..."
+  logger -t pdanet-cli "USB enabled on ${PDANET_USB_IFACE}" || true
+  ok "PdaNet USB enabled."
+}
+
+usb_turn_off() {
+  require_root usb off
+
+  if [[ ! -d "$PDANET_USB_STATE_DIR" ]]; then
+    printf 'PdaNet USB\n'
+    ok "Already disabled; no network changes made."
+    return
+  fi
+
+  printf 'Disabling PdaNet USB\n'
+  step 1 3 "Restoring DNS and removing USB routes..."
+  resolvectl revert "$PDANET_USB_IFACE" 2>/dev/null || true
+  resolvectl flush-caches 2>/dev/null || true
+  usb_remove_routes
+  ok "USB routes and DNS settings removed."
+
+  step 2 3 "Stopping the TUN helper..."
+  usb_stop_helper
+  ip link del "$PDANET_USB_IFACE" 2>/dev/null || true
+  ok "USB helper stopped."
+
+  step 3 3 "Removing the owned ADB forward..."
+  usb_remove_forward
+  usb_clear_state
+  logger -t pdanet-cli "USB disabled" || true
+  ok "PdaNet USB disabled."
+}
+
+usb_show_status() {
+  local serial target local_port pid helper_state iface_state route_state forward_state
+
+  serial="$(usb_saved_value "$PDANET_USB_SERIAL_FILE")"
+  target="$(usb_saved_value "$PDANET_USB_TARGET_FILE")"
+  local_port="$(usb_saved_value "$PDANET_USB_PORT_FILE")"
+  pid="$(usb_helper_pid)"
+  helper_state="stopped"
+  iface_state="missing"
+  route_state="inactive"
+  forward_state="missing"
+
+  usb_helper_running && helper_state="running"
+  ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1 && iface_state="present"
+  ip -4 route show exact 0.0.0.0/1 \
+    | grep -q "dev $PDANET_USB_IFACE" && route_state="active"
+  if [[ -n "$serial" && "$local_port" =~ ^[0-9]+$ ]] \
+      && adb -s "$serial" forward --list 2>/dev/null \
+        | awk -v port="tcp:$local_port" '$2 == port { found = 1 } END { exit !found }'; then
+    forward_state="active"
+  fi
+
+  printf 'PdaNet USB: %s\n' \
+    "$([[ "$helper_state" == running && "$route_state" == active ]] && printf enabled || printf disabled)"
+  printf '  Device:       %s\n' "${serial:-none}"
+  printf '  Phone target: %s\n' "${target:-none}"
+  printf '  ADB forward:  %s%s\n' "$forward_state" "${local_port:+ (127.0.0.1:$local_port)}"
+  printf '  Helper:       %s%s\n' "$helper_state" "${pid:+ (PID $pid)}"
+  printf '  Interface:    %s (%s)\n' "$PDANET_USB_IFACE" "$iface_state"
+  printf '  Routes:       %s\n' "$route_state"
+}
+
+usb_run_test() {
+  local serial target local_port result
+
+  [[ -x "$PDANET_USB_HELPER" ]] \
+    || die "Missing executable USB helper: $PDANET_USB_HELPER"
+  usb_helper_running \
+    && die "USB mode is already active; this isolated test would replace its phone session."
+
+  printf 'PdaNet USB isolated test\n'
+  step 1 3 "Running local protocol codec tests..."
+  "$PDANET_USB_HELPER" --self-test
+  ok "Frame codec and packet builder passed."
+
+  serial="$(usb_select_serial)"
+  target="$(usb_remote_target "$serial")"
+  local_port="$(adb -s "$serial" forward tcp:0 "$target" | tr -d '\r')"
+  [[ "$local_port" =~ ^[0-9]+$ ]] \
+    || die "ADB did not return a valid dynamically allocated port."
+
+  step 2 3 "Connecting to $target through ADB on 127.0.0.1:$local_port..."
+  ok "ADB transport is ready."
+
+  step 3 3 "Sending one DNS query through the PdaNet raw-IP tunnel..."
+  set +e
+  "$PDANET_USB_HELPER" --connect "127.0.0.1:$local_port" --probe
+  result=$?
+  set -e
+  adb -s "$serial" forward --remove "tcp:$local_port" 2>/dev/null || true
+  (( result == 0 )) || die "The isolated USB protocol test failed."
+  ok "USB protocol, phone forwarding, and response decoding passed."
+}
+
+usb_show_logs() {
+  local lines="${1:-80}"
+  [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > 0 )) \
+    || die "Log line count must be a positive number."
+  if [[ -r "$PDANET_USB_LOG_FILE" ]]; then
+    tail -n "$lines" "$PDANET_USB_LOG_FILE"
+  else
+    die "No PdaNet USB helper log exists."
+  fi
+}
+
+usb_main() {
+  case "${1:-on}" in
+    on|start) usb_turn_on ;;
+    off|stop) usb_turn_off ;;
+    status) usb_show_status ;;
+    test) usb_run_test ;;
+    logs) usb_show_logs "${2:-80}" ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main() {
+  case "${1:-help}" in
+    on) turn_on ;;
+    off) turn_off ;;
+    restart)
+      require_root restart
+      turn_off
+      turn_on
+      ;;
+    status) show_status ;;
+    test) run_test ;;
+    speedtest|speed) run_speedtest ;;
+    logs) show_logs "${2:-50}" ;;
+    usb) usb_main "${2:-on}" "${3:-}" ;;
+    help|-h|--help) usage ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
