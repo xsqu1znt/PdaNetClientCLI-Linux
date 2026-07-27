@@ -2,7 +2,8 @@
 
 A standalone Linux client for PdaNet+ Wi-Fi proxy and USB tethering modes.
 It does not use Android's built-in tethering APIs.
-**NOTE:** Currently only tested on my own machine (Fedora Linux 43)
+
+**NOTE:** Currently only tested on my own machine (Fedora Linux 43).
 
 ## Install
 
@@ -25,11 +26,45 @@ The installer:
 The systemd services are installed but are not enabled at boot. The CLI
 starts and stops them as needed.
 
+## Dependencies
+
+The installer checks the native package database and installs only missing
+packages. The exact package names are:
+
+| Distribution          | Packages                                                                                                                       |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Fedora / DNF          | `android-tools bash coreutils curl dnscrypt-proxy gawk glibc grep iproute nftables polkit python3 redsocks systemd util-linux` |
+| Debian / Ubuntu / APT | `adb bash coreutils curl dnscrypt-proxy gawk grep iproute2 libc-bin nftables policykit-1 python3 redsocks systemd util-linux`  |
+| Arch / Pacman         | `android-tools bash coreutils curl dnscrypt-proxy gawk glibc grep iproute2 nftables polkit python redsocks systemd util-linux` |
+
+The main components are ADB for the USB transport, Python for the USB
+tunnel helper, iproute and nftables for routing, redsocks and
+dnscrypt-proxy for Wi-Fi proxy mode, systemd/resolvectl for service and DNS
+management, and PolicyKit for privileged installation. Curl and the
+standard shell utilities are used for connection checks and lifecycle
+management.
+
 For development-only installation without package or system changes:
 
 ```bash
 ./install.sh --skip-packages --skip-system
 ```
+
+## How it connects
+
+In Wi-Fi Direct mode, the computer joins the network created by the PdaNet
+phone app. The CLI sends TCP traffic to the phone's HTTP proxy at
+`192.168.49.1:8000`: nftables redirects local TCP connections into
+redsocks, while dnscrypt-proxy supplies DNS. The phone then makes the
+outbound Internet connections on the computer's behalf.
+
+In USB mode, ADB forwards a dynamically selected localhost port to the
+PdaNet service listening on the phone. The USB helper performs PdaNet's
+binary handshake, creates the `pdanet0` TUN interface at `10.1.19.2`, and
+encapsulates raw IPv4 packets into PdaNet frames. The CLI installs routes
+and DNS for that interface; the phone decapsulates the packets, performs
+userspace TCP/UDP/DNS forwarding, and sends response packets back through
+the same ADB connection.
 
 ## USB tethering
 
