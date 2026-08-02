@@ -46,11 +46,17 @@ install_system_files() {
     "$SYSTEM_SOURCE_DIR/dnscrypt-proxy-pdanet.toml" \
     /etc/dnscrypt-proxy-pdanet.toml
   /usr/bin/install -D -m 0644 \
+    "$SYSTEM_SOURCE_DIR/dnscrypt-proxy-pdanet-usb.toml" \
+    /etc/dnscrypt-proxy-pdanet-usb.toml
+  /usr/bin/install -D -m 0644 \
     "$SYSTEM_SOURCE_DIR/systemd/system/pdanet-redsocks.service" \
     /etc/systemd/system/pdanet-redsocks.service
   /usr/bin/install -D -m 0644 \
     "$SYSTEM_SOURCE_DIR/systemd/system/pdanet-dnscrypt.service" \
     /etc/systemd/system/pdanet-dnscrypt.service
+  /usr/bin/install -D -m 0644 \
+    "$SYSTEM_SOURCE_DIR/systemd/system/pdanet-usb-dnscrypt.service" \
+    /etc/systemd/system/pdanet-usb-dnscrypt.service
 
   /usr/bin/systemctl daemon-reload
   ok "Installed system configuration and refreshed systemd."

@@ -10,16 +10,17 @@ readonly PDANET_STATE_DIR="/run/pdanet-tproxy"
 readonly PDANET_IFACE_FILE="$PDANET_STATE_DIR/interface"
 readonly REDSOCKS_SERVICE="pdanet-redsocks.service"
 readonly DNS_SERVICE="pdanet-dnscrypt.service"
+readonly USB_DNS_SERVICE="pdanet-usb-dnscrypt.service"
 readonly PDANET_USB_HELPER="${PDANET_USB_HELPER:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../libexec/pdanet-usb-helper}"
 readonly PDANET_USB_STATE_DIR="/run/pdanet-usb"
 readonly PDANET_USB_IFACE="${PDANET_USB_IFACE:-pdanet0}"
 readonly PDANET_USB_ADDRESS="10.1.19.2/24"
-readonly PDANET_USB_DNS="8.8.8.8"
 readonly PDANET_USB_SERIAL_FILE="$PDANET_USB_STATE_DIR/serial"
 readonly PDANET_USB_PORT_FILE="$PDANET_USB_STATE_DIR/local-port"
 readonly PDANET_USB_TARGET_FILE="$PDANET_USB_STATE_DIR/remote-target"
 readonly PDANET_USB_PID_FILE="$PDANET_USB_STATE_DIR/helper-pid"
 readonly PDANET_USB_LOG_FILE="$PDANET_USB_STATE_DIR/helper.log"
+readonly PDANET_USB_LAST_LOG_FILE="/run/pdanet-usb-helper.log"
 readonly -a PDANET_USB_ROUTES=(
   "0.0.0.0/1"
   "128.0.0.0/2"
@@ -276,6 +277,11 @@ turn_on() {
 
   require_root on
 
+  if [[ -d "$PDANET_USB_STATE_DIR" ]] \
+      || systemctl is-active --quiet "$USB_DNS_SERVICE"; then
+    die "USB mode is active. Run 'pdanet usb off' before enabling Wi-Fi proxy mode."
+  fi
+
   if [[ -n "$(saved_iface)" ]] && services_active; then
     iface="$(saved_iface)"
     printf 'PdaNet proxy\n'
@@ -350,6 +356,8 @@ turn_off() {
   require_root off
   if [[ -d "$PDANET_USB_STATE_DIR" ]]; then
     usb_turn_off
+  else
+    systemctl stop "$USB_DNS_SERVICE" 2>/dev/null || true
   fi
   iface="$(saved_iface)"
   if [[ -z "$iface" ]]; then
@@ -405,6 +413,7 @@ show_logs() {
   journalctl -t pdanet-cli -n "$lines" --no-pager
   printf '\n%s\n' 'Proxy services'
   journalctl -u "$REDSOCKS_SERVICE" -u "$DNS_SERVICE" \
+    -u "$USB_DNS_SERVICE" \
     -n "$lines" --no-pager
 }
 
@@ -511,16 +520,21 @@ usb_remove_forward() {
 }
 
 usb_clear_state() {
+  if [[ -s "$PDANET_USB_LOG_FILE" ]]; then
+    mv -f -- "$PDANET_USB_LOG_FILE" "$PDANET_USB_LAST_LOG_FILE"
+  else
+    rm -f -- "$PDANET_USB_LOG_FILE"
+  fi
   rm -f -- \
     "$PDANET_USB_SERIAL_FILE" \
     "$PDANET_USB_PORT_FILE" \
     "$PDANET_USB_TARGET_FILE" \
-    "$PDANET_USB_PID_FILE" \
-    "$PDANET_USB_LOG_FILE"
+    "$PDANET_USB_PID_FILE"
   rmdir -- "$PDANET_USB_STATE_DIR" 2>/dev/null || true
 }
 
 usb_cleanup() {
+  systemctl stop "$USB_DNS_SERVICE" 2>/dev/null || true
   [[ -d "$PDANET_USB_STATE_DIR" ]] || return 0
   resolvectl revert "$PDANET_USB_IFACE" 2>/dev/null || true
   resolvectl flush-caches 2>/dev/null || true
@@ -590,10 +604,13 @@ usb_start_impl() {
   ip address replace "$PDANET_USB_ADDRESS" dev "$PDANET_USB_IFACE" || return
   ip link set dev "$PDANET_USB_IFACE" mtu 1500 up || return
   usb_add_routes || return
-  resolvectl dns "$PDANET_USB_IFACE" "$PDANET_USB_DNS" || return
+  systemctl start "$USB_DNS_SERVICE" || return
+  wait_for_listener "$PDANET_DNS_PORT" || return
+  resolvectl dns "$PDANET_USB_IFACE" "127.0.0.1:${PDANET_DNS_PORT}" || return
   resolvectl domain "$PDANET_USB_IFACE" '~.' || return
   resolvectl default-route "$PDANET_USB_IFACE" yes || return
   resolvectl flush-caches || true
+  timeout 15 resolvectl query example.com >/dev/null || return
 }
 
 usb_turn_on() {
@@ -602,17 +619,24 @@ usb_turn_on() {
   [[ -x "$PDANET_USB_HELPER" ]] \
     || die "Missing executable USB helper: $PDANET_USB_HELPER"
   need_cmd adb
+  need_cmd dnscrypt-proxy
   need_cmd ip
   need_cmd nohup
   need_cmd resolvectl
+  need_cmd ss
+  need_cmd systemctl
+  need_cmd timeout
 
   if usb_helper_running \
-      && ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1; then
+      && ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1 \
+      && systemctl is-active --quiet "$USB_DNS_SERVICE"; then
     printf 'PdaNet USB\n'
     ok "Already enabled on $PDANET_USB_IFACE; no network changes made."
     return
   fi
-  if [[ -n "$(saved_iface)" ]] || services_active; then
+  if [[ -n "$(saved_iface)" ]] \
+      || systemctl is-active --quiet "$REDSOCKS_SERVICE" \
+      || systemctl is-active --quiet "$DNS_SERVICE"; then
     die "Wi-Fi proxy mode is active. Run 'pdanet off' before enabling USB mode."
   fi
 
@@ -635,7 +659,7 @@ usb_turn_on() {
   step 3 4 "Installing scoped IPv4 routes and blocking IPv6 bypass..."
   ok "Internet routes now prefer the PdaNet tunnel; local 192.168/16 is preserved."
 
-  step 4 4 "Pointing system DNS at $PDANET_USB_DNS through the tunnel..."
+  step 4 4 "Routing system DNS through the local encrypted resolver..."
   logger -t pdanet-cli "USB enabled on ${PDANET_USB_IFACE}" || true
   ok "PdaNet USB enabled."
 }
@@ -644,17 +668,19 @@ usb_turn_off() {
   require_root usb off
 
   if [[ ! -d "$PDANET_USB_STATE_DIR" ]]; then
+    systemctl stop "$USB_DNS_SERVICE" 2>/dev/null || true
     printf 'PdaNet USB\n'
     ok "Already disabled; no network changes made."
     return
   fi
 
   printf 'Disabling PdaNet USB\n'
-  step 1 3 "Restoring DNS and removing USB routes..."
+  step 1 3 "Restoring DNS and stopping the encrypted resolver..."
   resolvectl revert "$PDANET_USB_IFACE" 2>/dev/null || true
   resolvectl flush-caches 2>/dev/null || true
+  systemctl stop "$USB_DNS_SERVICE" 2>/dev/null || true
   usb_remove_routes
-  ok "USB routes and DNS settings removed."
+  ok "USB routes and DNS service removed."
 
   step 2 3 "Stopping the TUN helper..."
   usb_stop_helper
@@ -669,7 +695,7 @@ usb_turn_off() {
 }
 
 usb_show_status() {
-  local serial target local_port pid helper_state iface_state route_state forward_state
+  local serial target local_port pid helper_state iface_state route_state forward_state dns_state
 
   serial="$(usb_saved_value "$PDANET_USB_SERIAL_FILE")"
   target="$(usb_saved_value "$PDANET_USB_TARGET_FILE")"
@@ -679,6 +705,7 @@ usb_show_status() {
   iface_state="missing"
   route_state="inactive"
   forward_state="missing"
+  dns_state="$(systemctl is-active "$USB_DNS_SERVICE" 2>/dev/null || true)"
 
   usb_helper_running && helper_state="running"
   ip link show dev "$PDANET_USB_IFACE" >/dev/null 2>&1 && iface_state="present"
@@ -691,13 +718,14 @@ usb_show_status() {
   fi
 
   printf 'PdaNet USB: %s\n' \
-    "$([[ "$helper_state" == running && "$route_state" == active ]] && printf enabled || printf disabled)"
+    "$([[ "$helper_state" == running && "$route_state" == active && "$dns_state" == active ]] && printf enabled || printf disabled)"
   printf '  Device:       %s\n' "${serial:-none}"
   printf '  Phone target: %s\n' "${target:-none}"
   printf '  ADB forward:  %s%s\n' "$forward_state" "${local_port:+ (127.0.0.1:$local_port)}"
   printf '  Helper:       %s%s\n' "$helper_state" "${pid:+ (PID $pid)}"
   printf '  Interface:    %s (%s)\n' "$PDANET_USB_IFACE" "$iface_state"
   printf '  Routes:       %s\n' "$route_state"
+  printf '  DNS service:  %s\n' "${dns_state:-unknown}"
 }
 
 usb_run_test() {
@@ -738,6 +766,8 @@ usb_show_logs() {
     || die "Log line count must be a positive number."
   if [[ -r "$PDANET_USB_LOG_FILE" ]]; then
     tail -n "$lines" "$PDANET_USB_LOG_FILE"
+  elif [[ -r "$PDANET_USB_LAST_LOG_FILE" ]]; then
+    tail -n "$lines" "$PDANET_USB_LAST_LOG_FILE"
   else
     die "No PdaNet USB helper log exists."
   fi

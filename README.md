@@ -38,9 +38,9 @@ packages. The exact package names are:
 | Arch / Pacman         | `android-tools bash coreutils curl dnscrypt-proxy gawk glibc grep iproute2 nftables polkit python redsocks systemd util-linux` |
 
 The main components are ADB for the USB transport, Python for the USB
-tunnel helper, iproute and nftables for routing, redsocks and
-dnscrypt-proxy for Wi-Fi proxy mode, systemd/resolvectl for service and DNS
-management, and PolicyKit for privileged installation. Curl and the
+tunnel helper, iproute and nftables for routing, redsocks for Wi-Fi proxy
+mode, dnscrypt-proxy for encrypted DNS in both modes, systemd/resolvectl for
+service and DNS management, and PolicyKit for privileged installation. Curl and the
 standard shell utilities are used for connection checks and lifecycle
 management.
 
@@ -62,9 +62,10 @@ In USB mode, ADB forwards a dynamically selected localhost port to the
 PdaNet service listening on the phone. The USB helper performs PdaNet's
 binary handshake, creates the `pdanet0` TUN interface at `10.1.19.2`, and
 encapsulates raw IPv4 packets into PdaNet frames. The CLI installs routes
-and DNS for that interface; the phone decapsulates the packets, performs
-userspace TCP/UDP/DNS forwarding, and sends response packets back through
-the same ADB connection.
+for that interface and runs a local DNS-over-HTTPS resolver whose TCP
+connection crosses the tunnel. The phone decapsulates the packets, performs
+userspace forwarding, and sends response packets back through the same ADB
+connection.
 
 ## USB tethering
 

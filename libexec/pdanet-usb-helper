@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 HEADER_SIZE = 32
 MAX_PAYLOAD = 65535
+MAX_TUN_READ_BATCH = 256
 CMD_HELLO = 15
 CMD_IP_PACKET = 64
 CMD_DEVICE_MODEL = 302
@@ -121,6 +122,28 @@ def open_tun(name: str) -> tuple[int, str]:
     return descriptor, actual_name
 
 
+def forward_tun_packets(
+    tun_descriptor: int,
+    connection: socket.socket,
+) -> int:
+    """Drain a bounded batch of phone-bound packets from the TUN interface."""
+    frames = bytearray()
+    packet_count = 0
+    for _ in range(MAX_TUN_READ_BATCH):
+        try:
+            packet = os.read(tun_descriptor, MAX_PAYLOAD)
+        except BlockingIOError:
+            break
+        if not packet:
+            break
+        if packet[0] >> 4 == 4:
+            frames.extend(encode_client_frame(CMD_IP_PACKET, packet))
+            packet_count += 1
+    if frames:
+        connection.sendall(frames)
+    return packet_count
+
+
 def checksum(data: bytes) -> int:
     if len(data) % 2:
         data += b"\0"
@@ -128,6 +151,22 @@ def checksum(data: bytes) -> int:
     while total >> 16:
         total = (total & 0xFFFF) + (total >> 16)
     return (~total) & 0xFFFF
+
+
+def repair_ipv4_header_checksum(packet: bytes) -> tuple[bytes, bool]:
+    """Repair the occasional invalid IPv4 checksum emitted by PdaNet."""
+    if len(packet) < 20 or packet[0] >> 4 != 4:
+        raise ProtocolError("phone sent an invalid IPv4 packet")
+    header_length = (packet[0] & 0x0F) * 4
+    if header_length < 20 or header_length > len(packet):
+        raise ProtocolError("phone sent an invalid IPv4 header length")
+    if checksum(packet[:header_length]) == 0:
+        return packet, False
+
+    repaired = bytearray(packet)
+    repaired[10:12] = b"\0\0"
+    struct.pack_into("!H", repaired, 10, checksum(bytes(repaired[:header_length])))
+    return bytes(repaired), True
 
 
 def build_dns_probe(
@@ -263,14 +302,7 @@ def run_bridge(endpoint: tuple[str, int], tun_name: str, timeout: float) -> int:
             while not stopped:
                 for key, _ in selector.select(timeout=1.0):
                     if key.data == "tun":
-                        try:
-                            packet = os.read(tun_descriptor, MAX_PAYLOAD)
-                        except BlockingIOError:
-                            continue
-                        if packet and packet[0] >> 4 == 4:
-                            connection.sendall(
-                                encode_client_frame(CMD_IP_PACKET, packet)
-                            )
+                        forward_tun_packets(tun_descriptor, connection)
                     else:
                         try:
                             data = connection.recv(65536)
@@ -280,7 +312,17 @@ def run_bridge(endpoint: tuple[str, int], tun_name: str, timeout: float) -> int:
                             raise ProtocolError("phone closed the PdaNet tunnel")
                         for frame in decoder.feed(data):
                             if frame.command == CMD_IP_PACKET and frame.payload:
-                                os.write(tun_descriptor, frame.payload)
+                                packet, repaired = repair_ipv4_header_checksum(
+                                    frame.payload
+                                )
+                                if repaired:
+                                    log("repaired invalid phone IPv4 header checksum")
+                                written = os.write(tun_descriptor, packet)
+                                if written != len(packet):
+                                    raise ProtocolError(
+                                        "short TUN write: "
+                                        f"wrote {written} of {len(packet)} bytes"
+                                    )
                             elif frame.command in (29, 31) and frame.payload:
                                 message = frame.payload.decode(
                                     "utf-8", errors="replace"
@@ -313,12 +355,43 @@ def run_self_test() -> int:
     frames = decoder.feed(server_header[11:] + payload)
     assert frames == [ServerFrame(CMD_IP_PACKET, 7, payload, 0)]
 
+    tun_send, tun_receive = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    phone_send, phone_receive = socket.socketpair()
+    try:
+        tun_receive.setblocking(False)
+        packets = [payload, b"\x60not-ipv4", payload + b"second"]
+        for test_packet in packets:
+            tun_send.sendall(test_packet)
+        assert forward_tun_packets(tun_receive.fileno(), phone_send) == 2
+        expected = b"".join(
+            encode_client_frame(CMD_IP_PACKET, test_packet)
+            for test_packet in (packets[0], packets[2])
+        )
+        assert phone_receive.recv(len(expected), socket.MSG_WAITALL) == expected
+    finally:
+        tun_send.close()
+        tun_receive.close()
+        phone_send.close()
+        phone_receive.close()
+
     transaction_id = 0x1234
     source_port = 40000
     packet = build_dns_probe(transaction_id, source_port)
     assert packet[0] == 0x45
     assert struct.unpack_from("!H", packet, 2)[0] == len(packet)
     assert checksum(packet[:20]) == 0
+    corrupted_packet = bytearray(packet)
+    corrupted_packet[10:12] = b"\xff\xff"
+    repaired_packet, was_repaired = repair_ipv4_header_checksum(
+        bytes(corrupted_packet)
+    )
+    assert was_repaired
+    assert repaired_packet[:10] == packet[:10]
+    assert repaired_packet[12:] == packet[12:]
+    assert checksum(repaired_packet[:20]) == 0
+    unchanged_packet, was_repaired = repair_ipv4_header_checksum(packet)
+    assert not was_repaired
+    assert unchanged_packet is packet
     assert socket.inet_ntoa(packet[12:16]) == "10.1.19.2"
     assert socket.inet_ntoa(packet[16:20]) == "8.8.8.8"
     print("pdanet-usb-helper self-test passed.")
