@@ -83,8 +83,12 @@ pdanet usb off
 changes the host's Internet routes and DNS, so it can interrupt existing
 network sessions.
 
-Set `PDANET_ADB_SERIAL` when more than one authorized ADB device is
-connected.
+If more than one authorized ADB device is connected, `pdanet usb` lists them
+with zero-based indexes. Select the phone with `pdanet usb 0` (using its
+listed index); `pdanet usb test 0` selects the same device for the isolated
+test. Indexes can change when devices connect or disconnect, so check the list
+again if your devices change. You can also set `PDANET_ADB_SERIAL` to the
+phone's ADB serial; an explicit index takes precedence.
 
 ## Wi-Fi Direct proxy
 

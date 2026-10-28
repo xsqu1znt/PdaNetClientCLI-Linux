@@ -70,10 +70,10 @@ Commands:
   test            Test DNS and HTTPS through the transparent proxy
   speedtest       Measure download and upload speed through PdaNet
   logs [LINES]    Show recent service logs (default: 50 lines)
-  usb [on]        Enable PdaNet USB through an ADB-backed TUN interface
+  usb [INDEX]     Enable USB, selecting an ADB device by index if needed
   usb off         Disable USB mode and remove only its routes/ADB forward
   usb status      Show USB helper, interface, route, and ADB state
-  usb test        Safely test the USB protocol without changing routes
+  usb test [INDEX] Safely test the USB protocol without changing routes
   usb logs        Show the USB helper log
   help            Show this help
 
@@ -437,12 +437,12 @@ usb_helper_running() {
 }
 
 usb_select_serial() {
-  local requested="${PDANET_ADB_SERIAL:-}"
-  local line
+  local index="${1:-}" requested="${PDANET_ADB_SERIAL:-}"
+  local line serial number=0
   local -a devices=()
 
   need_cmd adb
-  if [[ -n "$requested" ]]; then
+  if [[ -n "$requested" && -z "$index" ]]; then
     if adb -s "$requested" get-state 2>/dev/null | grep -qx device; then
       printf '%s\n' "$requested"
       return
@@ -450,15 +450,38 @@ usb_select_serial() {
     die "ADB device is not available or authorized: $requested"
   fi
 
+  [[ -z "$index" || "$index" =~ ^[0-9]+$ ]] \
+    || die "Device index must be a non-negative number."
   while IFS= read -r line; do
     [[ -n "$line" ]] && devices+=("$line")
-  done < <(adb devices | awk 'NR > 1 && $2 == "device" { print $1 }')
+  done < <(adb devices -l | awk 'NR > 1 && $2 == "device" { $1 = $1; print }' | LC_ALL=C sort)
 
-  case "${#devices[@]}" in
-    0) die "No authorized ADB device found. Connect the phone and allow USB debugging." ;;
-    1) printf '%s\n' "${devices[0]}" ;;
-    *) die "Multiple ADB devices found. Set PDANET_ADB_SERIAL to select one." ;;
-  esac
+  (( ${#devices[@]} > 0 )) \
+    || die "No authorized ADB device found. Connect the phone and allow USB debugging."
+  if [[ -z "$index" && ${#devices[@]} -eq 1 ]]; then
+    printf '%s\n' "${devices[0]%% *}"
+    return
+  fi
+
+  for line in "${devices[@]}"; do
+    if [[ -n "$index" && "$index" == "$number" ]]; then
+      serial="${line%% *}"
+      printf '%s\n' "$serial"
+      return
+    fi
+    ((number += 1))
+  done
+
+  printf '  Authorized ADB devices:\n' >&2
+  number=0
+  for line in "${devices[@]}"; do
+    printf '    %s: %s\n' "$number" "$line" >&2
+    ((number += 1))
+  done
+  if [[ -n "$index" ]]; then
+    die "Device index $index is not available."
+  fi
+  die "Select a device with 'pdanet usb INDEX' or 'pdanet usb test INDEX'."
 }
 
 usb_remote_target() {
@@ -565,9 +588,7 @@ usb_add_routes() {
 }
 
 usb_start_impl() {
-  local serial target local_port pid attempt
-
-  serial="$(usb_select_serial)" || return
+  local serial="$1" target local_port pid attempt
   target="$(usb_remote_target "$serial")" || return
 
   mkdir -p -- "$PDANET_USB_STATE_DIR" || return
@@ -614,7 +635,11 @@ usb_start_impl() {
 }
 
 usb_turn_on() {
-  require_root usb on
+  local serial
+  serial="$(usb_select_serial "${1:-}")" || return
+  if (( EUID != 0 )); then
+    exec sudo -- env PDANET_ADB_SERIAL="$serial" "$0" usb on
+  fi
 
   [[ -x "$PDANET_USB_HELPER" ]] \
     || die "Missing executable USB helper: $PDANET_USB_HELPER"
@@ -643,7 +668,7 @@ usb_turn_on() {
   usb_cleanup
   printf 'Enabling PdaNet USB\n'
   step 1 4 "Opening an ADB connection to the PdaNet phone service..."
-  if ! usb_start_impl; then
+  if ! usb_start_impl "$serial"; then
     if [[ -s "$PDANET_USB_LOG_FILE" ]]; then
       warn "USB helper output:"
       tail -n 20 "$PDANET_USB_LOG_FILE" >&2
@@ -741,7 +766,7 @@ usb_run_test() {
   "$PDANET_USB_HELPER" --self-test
   ok "Frame codec and packet builder passed."
 
-  serial="$(usb_select_serial)"
+  serial="$(usb_select_serial "${1:-}")"
   target="$(usb_remote_target "$serial")"
   local_port="$(adb -s "$serial" forward tcp:0 "$target" | tr -d '\r')"
   [[ "$local_port" =~ ^[0-9]+$ ]] \
@@ -775,14 +800,18 @@ usb_show_logs() {
 
 usb_main() {
   case "${1:-on}" in
-    on|start) usb_turn_on ;;
+    on|start) usb_turn_on "${2:-}" ;;
     off|stop) usb_turn_off ;;
     status) usb_show_status ;;
-    test) usb_run_test ;;
+    test) usb_run_test "${2:-}" ;;
     logs) usb_show_logs "${2:-80}" ;;
     *)
-      usage >&2
-      exit 2
+      if [[ "$1" =~ ^[0-9]+$ && -z "${2:-}" ]]; then
+        usb_turn_on "$1"
+      else
+        usage >&2
+        exit 2
+      fi
       ;;
   esac
 }
